@@ -1,0 +1,210 @@
+name: UV Python CI (ruff/semgrep/pytest/audit/gitleaks/trivy)
+
+"on":
+  workflow_call:
+    inputs:
+      python-version-file:
+        description: "Path to a file containing Python version (recommended: .python-version)"
+        type: string
+        default: ".python-version"
+
+      # If provided, we run a matrix (caller controls versions; central doesn't hardcode).
+      python-versions-json:
+        description: 'JSON list like ["3.11","3.12"]. If empty, uses python-version-file for single run.'
+        type: string
+        default: ""
+
+      run-ruff:
+        type: boolean
+        default: true
+      run-semgrep:
+        type: boolean
+        default: true
+      run-tests:
+        type: boolean
+        default: true
+      run-pip-audit:
+        type: boolean
+        default: true
+      run-gitleaks:
+        type: boolean
+        default: true
+      run-trivy:
+        type: boolean
+        default: true
+
+      pip-audit-ignore:
+        description: "Space-separated CVEs to ignore (optional)"
+        type: string
+        default: ""
+
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: uv-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-matrix:
+    if: ${{ inputs.python-versions-json != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions-json) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install deps
+        run: uv sync
+
+      - name: Install CI tools (only if not in dev deps)
+        run: uv pip install ruff semgrep pip-audit
+
+      - name: Ruff (lint)
+        if: ${{ inputs.run-ruff }}
+        run: uv run ruff check .
+
+      - name: Ruff (format check)
+        if: ${{ inputs.run-ruff }}
+        run: uv run ruff format --check .
+
+      - name: Semgrep
+        if: ${{ inputs.run-semgrep }}
+        continue-on-error: true
+        run: uv tool run semgrep scan --error --config auto
+
+      # Ignoring pylint per your request
+
+      - name: Pytest + coverage
+        if: ${{ inputs.run-tests }}
+        run: uv run pytest --cov --cov-branch --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        if: ${{ inputs.run-tests && secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: pip-audit
+        if: ${{ inputs.run-pip-audit }}
+        run: |
+          if [ -n "${{ inputs.pip-audit-ignore }}" ]; then
+            uv run pip-audit $(for cve in ${{ inputs.pip-audit-ignore }}; do echo "--ignore-vuln $cve"; done)
+          else
+            uv run pip-audit
+          fi
+
+      - name: Gitleaks (SARIF)
+        if: ${{ inputs.run-gitleaks }}
+        run: |
+          uv tool run gitleaks detect --source . --report-format sarif --report-path results.sarif --verbose
+
+      - name: Upload Gitleaks SARIF
+        if: ${{ inputs.run-gitleaks }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif-${{ github.run_id }}-${{ runner.os }}-py${{ matrix.python-version }}
+          path: results.sarif
+          overwrite: true
+
+      - name: Trivy scan
+        if: ${{ inputs.run-trivy }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          security-checks: vuln,config
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+
+  ci-single:
+    if: ${{ inputs.python-versions-json == '' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No hardcoded version; read from file in the *repo being built*
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ${{ inputs.python-version-file }}
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install deps
+        run: uv sync
+
+      - name: Install CI tools (only if not in dev deps)
+        run: uv pip install ruff semgrep pip-audit
+
+      - name: Ruff (lint)
+        if: ${{ inputs.run-ruff }}
+        run: uv run ruff check .
+
+      - name: Ruff (format check)
+        if: ${{ inputs.run-ruff }}
+        run: uv run ruff format --check .
+
+      - name: Semgrep
+        if: ${{ inputs.run-semgrep }}
+        continue-on-error: true
+        run: uv tool run semgrep scan --error --config auto
+
+      - name: Pytest + coverage
+        if: ${{ inputs.run-tests }}
+        run: uv run pytest --cov --cov-branch --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        if: ${{ inputs.run-tests && secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: pip-audit
+        if: ${{ inputs.run-pip-audit }}
+        run: |
+          if [ -n "${{ inputs.pip-audit-ignore }}" ]; then
+            uv run pip-audit $(for cve in ${{ inputs.pip-audit-ignore }}; do echo "--ignore-vuln $cve"; done)
+          else
+            uv run pip-audit
+          fi
+
+      - name: Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+      - name: Upload Gitleaks SARIF
+        if: ${{ inputs.run-gitleaks }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif-${{ github.run_id }}-${{ runner.os }}-py${{ matrix.python-version }}
+          path: results.sarif
+          overwrite: true
+
+      - name: Trivy scan
+        if: ${{ inputs.run-trivy }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          security-checks: vuln,config
+          exit-code: "1"
+          severity: CRITICAL,HIGH
